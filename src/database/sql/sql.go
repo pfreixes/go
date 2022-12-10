@@ -469,7 +469,7 @@ type DB struct {
 	numOpen      int    // number of opened and pending open connections
 	// Used to signal the need for new connections
 	// a goroutine running connectionOpener() reads on this chan and
-	// maybeOpenNewConnections sends on the chan (one send per needed connection)
+	// maybeOpenNewConnectionsDBLocked sends on the chan (one send per needed connection)
 	// It is closed during db.Close(). The close tells the connectionOpener
 	// goroutine to exit.
 	openerCh          chan struct{}
@@ -486,7 +486,8 @@ type DB struct {
 	maxIdleTimeClosed int64 // Total number of connections closed due to idle time.
 	maxLifetimeClosed int64 // Total number of connections closed due to max connection lifetime limit.
 
-	stop func() // stop cancels the connection opener.
+	stop                        func() // stop cancels the connection opener.
+	openNewConnectionCancelable func() // opens a connection.
 }
 
 // connReuseStrategy determines how (*DB).conn returns database connections.
@@ -647,7 +648,7 @@ func (dc *driverConn) finalClose() error {
 
 	dc.db.mu.Lock()
 	dc.db.numOpen--
-	dc.db.maybeOpenNewConnections()
+	dc.db.maybeOpenNewConnectionsDBLocked()
 	dc.db.mu.Unlock()
 
 	dc.db.numClosed.Add(1)
@@ -742,13 +743,6 @@ func (db *DB) removeDepLocked(x finalCloser, dep any) func() error {
 	}
 }
 
-// This is the size of the connectionOpener request chan (DB.openerCh).
-// This value should be larger than the maximum typical value
-// used for db.maxOpen. If maxOpen is significantly larger than
-// connectionRequestQueueSize then it is possible for ALL calls into the *DB
-// to block until the connectionOpener can satisfy the backlog of requests.
-var connectionRequestQueueSize = 1000000
-
 type dsnConnector struct {
 	dsn    string
 	driver driver.Driver
@@ -782,13 +776,15 @@ func OpenDB(c driver.Connector) *DB {
 	ctx, cancel := context.WithCancel(context.Background())
 	db := &DB{
 		connector:    c,
-		openerCh:     make(chan struct{}, connectionRequestQueueSize),
+		openerCh:     make(chan struct{}, 1),
 		lastPut:      make(map[*driverConn]string),
 		connRequests: make(map[uint64]chan connRequest),
 		stop:         cancel,
 	}
 
-	go db.connectionOpener(ctx)
+	db.openNewConnectionCancelable = func() {
+		db.openNewConnection(ctx)
+	}
 
 	return db
 }
@@ -1191,43 +1187,51 @@ func (db *DB) Stats() DBStats {
 	return stats
 }
 
-// Assumes db.mu is locked.
-// If there are connRequests and the connection limit hasn't been reached,
-// then tell the connectionOpener to open new connections.
-func (db *DB) maybeOpenNewConnections() {
-	numRequests := len(db.connRequests)
-	if db.maxOpen > 0 {
-		numCanOpen := db.maxOpen - db.numOpen
-		if numRequests > numCanOpen {
-			numRequests = numCanOpen
-		}
-	}
-	for numRequests > 0 {
-		db.numOpen++ // optimistically
-		numRequests--
-		if db.closed {
-			return
-		}
-		db.openerCh <- struct{}{}
-	}
+func (db *DB) maybeOpenNewConnection() {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	db.maybeOpenNewConnectionsDBLocked()
 }
 
-// Runs in a separate goroutine, opens new connections when requested.
-func (db *DB) connectionOpener(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-db.openerCh:
-			db.openNewConnection(ctx)
-		}
+// If there are connRequests and the connection limit hasn't been reached,
+// tries to open a new connection if there is any already inflight, if there
+// is will not create a new one. Once a connection is created the system will
+// proactively keep calling maybeOpenNewConnections for creating new ones if
+// required.
+func (db *DB) maybeOpenNewConnectionsDBLocked() {
+	if db.closed {
+		return
+	}
+
+	// no pending connection requests
+	if len(db.connRequests) == 0 {
+		return
+	}
+
+	// already reached the limit of number openned connections
+	if db.maxOpen > 0 && db.numOpen >= db.maxOpen {
+		return
+	}
+
+	select {
+	case db.openerCh <- struct{}{}:
+		db.numOpen++ // optimistically
+		go func() {
+			db.openNewConnectionCancelable()
+			// allow new calls for openNewConnection
+			<-db.openerCh
+			// check if we might need to keep openning connections
+			db.maybeOpenNewConnection()
+		}()
+	default:
+		// there is already an inflight open connection
 	}
 }
 
 // Open one new connection
 func (db *DB) openNewConnection(ctx context.Context) {
-	// maybeOpenNewConnections has already executed db.numOpen++ before it sent
-	// on db.openerCh. This function must execute db.numOpen-- if the
+	// maybeOpenNewConnectionsDBLocked has already executed db.numOpen++ before.
+	// This function must execute db.numOpen-- if the
 	// connection fails or is closed before returning.
 	ci, err := db.connector.Connect(ctx)
 	db.mu.Lock()
@@ -1239,24 +1243,27 @@ func (db *DB) openNewConnection(ctx context.Context) {
 		db.numOpen--
 		return
 	}
+
 	if err != nil {
 		db.numOpen--
 		db.putConnDBLocked(nil, err)
-		db.maybeOpenNewConnections()
 		return
 	}
+
 	dc := &driverConn{
 		db:         db,
 		createdAt:  nowFunc(),
 		returnedAt: nowFunc(),
 		ci:         ci,
 	}
+
 	if db.putConnDBLocked(dc, err) {
 		db.addDepLocked(dc, dc)
 	} else {
 		db.numOpen--
 		ci.Close()
 	}
+
 }
 
 // connRequest represents one request for a new connection
@@ -1318,91 +1325,71 @@ func (db *DB) conn(ctx context.Context, strategy connReuseStrategy) (*driverConn
 		return conn, nil
 	}
 
-	// Out of free connections or we were asked not to use one. If we're not
-	// allowed to open any more connections, make a request and wait.
-	if db.maxOpen > 0 && db.numOpen >= db.maxOpen {
-		// Make the connRequest channel. It's buffered so that the
-		// connectionOpener doesn't block while waiting for the req to be read.
-		req := make(chan connRequest, 1)
-		reqKey := db.nextRequestKeyLocked()
-		db.connRequests[reqKey] = req
-		db.waitCount++
-		db.mu.Unlock()
-
-		waitStart := nowFunc()
-
-		// Timeout the connection request with the context.
-		select {
-		case <-ctx.Done():
-			// Remove the connection request and ensure no value has been sent
-			// on it after removing.
-			db.mu.Lock()
-			delete(db.connRequests, reqKey)
-			db.mu.Unlock()
-
-			db.waitDuration.Add(int64(time.Since(waitStart)))
-
-			select {
-			default:
-			case ret, ok := <-req:
-				if ok && ret.conn != nil {
-					db.putConn(ret.conn, ret.err, false)
-				}
-			}
-			return nil, ctx.Err()
-		case ret, ok := <-req:
-			db.waitDuration.Add(int64(time.Since(waitStart)))
-
-			if !ok {
-				return nil, errDBClosed
-			}
-			// Only check if the connection is expired if the strategy is cachedOrNewConns.
-			// If we require a new connection, just re-use the connection without looking
-			// at the expiry time. If it is expired, it will be checked when it is placed
-			// back into the connection pool.
-			// This prioritizes giving a valid connection to a client over the exact connection
-			// lifetime, which could expire exactly after this point anyway.
-			if strategy == cachedOrNewConn && ret.err == nil && ret.conn.expired(lifetime) {
-				db.mu.Lock()
-				db.maxLifetimeClosed++
-				db.mu.Unlock()
-				ret.conn.Close()
-				return nil, driver.ErrBadConn
-			}
-			if ret.conn == nil {
-				return nil, ret.err
-			}
-
-			// Reset the session if required.
-			if err := ret.conn.resetSession(ctx); errors.Is(err, driver.ErrBadConn) {
-				ret.conn.Close()
-				return nil, err
-			}
-			return ret.conn, ret.err
-		}
-	}
-
-	db.numOpen++ // optimistically
+	// Make the connRequest channel. It's buffered so that the
+	// connectionOpener doesn't block while waiting for the req to be read.
+	req := make(chan connRequest, 1)
+	reqKey := db.nextRequestKeyLocked()
+	db.connRequests[reqKey] = req
+	db.waitCount++
 	db.mu.Unlock()
-	ci, err := db.connector.Connect(ctx)
-	if err != nil {
+
+	// if there is room for new connecetions we might create one, but the
+	// requester could be waken up for any new connection released back
+	// to the pool.
+	db.maybeOpenNewConnectionsDBLocked()
+
+	waitStart := nowFunc()
+
+	// Timeout the connection request with the context.
+	select {
+	case <-ctx.Done():
+		// Remove the connection request and ensure no value has been sent
+		// on it after removing.
 		db.mu.Lock()
-		db.numOpen-- // correct for earlier optimism
-		db.maybeOpenNewConnections()
+		delete(db.connRequests, reqKey)
 		db.mu.Unlock()
-		return nil, err
+
+		atomic.AddInt64(&db.waitDuration, int64(time.Since(waitStart)))
+
+		select {
+		default:
+		case ret, ok := <-req:
+			if ok && ret.conn != nil {
+				db.putConn(ret.conn, ret.err, false)
+			}
+		}
+		return nil, ctx.Err()
+	case ret, ok := <-req:
+		atomic.AddInt64(&db.waitDuration, int64(time.Since(waitStart)))
+
+		if !ok {
+			return nil, errDBClosed
+		}
+		// Only check if the connection is expired if the strategy is cachedOrNewConns.
+		// If we require a new connection, just re-use the connection without looking
+		// at the expiry time. If it is expired, it will be checked when it is placed
+		// back into the connection pool.
+		// This prioritizes giving a valid connection to a client over the exact connection
+		// lifetime, which could expire exactly after this point anyway.
+		if strategy == cachedOrNewConn && ret.err == nil && ret.conn.expired(lifetime) {
+			db.mu.Lock()
+			db.maxLifetimeClosed++
+			db.mu.Unlock()
+			ret.conn.Close()
+			return nil, driver.ErrBadConn
+		}
+		if ret.conn == nil {
+			return nil, ret.err
+		}
+
+		// Reset the session if required.
+		if err := ret.conn.resetSession(ctx); errors.Is(err, driver.ErrBadConn) {
+			ret.conn.Close()
+			return nil, err
+		}
+		return ret.conn, ret.err
 	}
-	db.mu.Lock()
-	dc := &driverConn{
-		db:         db,
-		createdAt:  nowFunc(),
-		returnedAt: nowFunc(),
-		ci:         ci,
-		inUse:      true,
-	}
-	db.addDepLocked(dc, dc)
-	db.mu.Unlock()
-	return dc, nil
+
 }
 
 // putConnHook is a hook for testing.
@@ -1469,7 +1456,7 @@ func (db *DB) putConn(dc *driverConn, err error, resetSession bool) {
 		// Since the conn is considered bad and is being discarded, treat it
 		// as closed. Don't decrement the open count here, finalClose will
 		// take care of that.
-		db.maybeOpenNewConnections()
+		db.maybeOpenNewConnectionsDBLocked()
 		db.mu.Unlock()
 		dc.Close()
 		return
